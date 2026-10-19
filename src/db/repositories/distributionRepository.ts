@@ -70,6 +70,45 @@ export interface CreatePayoutInput {
 }
 
 /**
+ * @title SearchPayoutsParams
+ * @dev Parameters accepted by `searchPayoutsByInvestor`.
+ * All filters, sort options, and pagination are pushed into SQL so that the
+ * database—not Node—performs the heavy lifting.
+ *
+ * Security contract:
+ * - `sortBy` MUST be one of the values in ALLOWED_PAYOUT_SORT_COLUMNS.
+ *   The method throws immediately when an unknown column is supplied.
+ * - `sortOrder` MUST be 'asc' or 'desc'.
+ * - Every other value is treated as a parameterised bind variable; no raw
+ *   string interpolation is performed for user-supplied data.
+ * - Amount comparisons use SQL NUMERIC so "10.5" sorts after "9.99".
+ */
+export interface SearchPayoutsParams {
+  investorId: string;
+  status?: 'pending' | 'processed' | 'failed';
+  minAmount?: number;
+  maxAmount?: number;
+  from?: Date;
+  to?: Date;
+  sortBy?: 'created_at' | 'amount' | 'status';
+  sortOrder?: 'asc' | 'desc';
+  limit: number;
+  offset: number;
+}
+
+/**
+ * @title SearchPayoutsResult
+ * @dev Returned by `searchPayoutsByInvestor`.
+ * `total` is the COUNT(*) OVER() window result — the number of rows matching
+ * all filters regardless of LIMIT/OFFSET, allowing callers to derive hasMore
+ * without issuing a separate COUNT query.
+ */
+export interface SearchPayoutsResult {
+  payouts: Payout[];
+  total: number;
+}
+
+/**
  * Distribution Repository
  * Handles database operations for distributions and payouts
  */
@@ -342,6 +381,119 @@ export class DistributionRepository {
     ]);
 
     return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  /**
+   * @dev Whitelisted column names for ORDER BY in `searchPayoutsByInvestor`.
+   * This set is the single authoritative source of truth: if a value is not
+   * here it is never interpolated into SQL, regardless of where the call
+   * originates. The route layer maintains a parallel allowlist for early
+   * HTTP 400 rejection so callers never reach this method with an invalid
+   * column — but this guard is the defence-in-depth backstop.
+   */
+  static readonly ALLOWED_PAYOUT_SORT_COLUMNS: ReadonlySet<string> = new Set([
+    'created_at',
+    'amount',
+    'status',
+  ]);
+
+  /**
+   * @title searchPayoutsByInvestor
+   * @dev Filtered, sorted, paginated payout query that pushes all work to the
+   * database.  Replaces the in-memory filter/sort/slice pattern that existed
+   * in the route layer.
+   *
+   * Security contract:
+   * - `sortBy` is validated against `ALLOWED_PAYOUT_SORT_COLUMNS` before any
+   *   interpolation.  An unknown column throws immediately so that no partial
+   *   query reaches the database.
+   * - `sortOrder` is asserted to be 'asc' | 'desc'.
+   * - All filter values are bound as parameters ($N) — never interpolated.
+   * - Amount comparisons use the NUMERIC cast so "10.5" sorts after "9.99".
+   * - `COUNT(*) OVER()` is a window aggregate over the filtered rows; it
+   *   returns the total matching count on every row so callers never need a
+   *   separate COUNT query.
+   *
+   * @param params  Filter + sort + pagination parameters.
+   * @returns `{ payouts, total }` where `total` is the full filtered count.
+   * @throws Error when `sortBy` is not in `ALLOWED_PAYOUT_SORT_COLUMNS`.
+   */
+  async searchPayoutsByInvestor(params: SearchPayoutsParams): Promise<SearchPayoutsResult> {
+    const {
+      investorId,
+      status,
+      minAmount,
+      maxAmount,
+      from,
+      to,
+      sortBy = 'created_at',
+      sortOrder = 'desc',
+      limit,
+      offset,
+    } = params;
+
+    // ── Column allowlist guard (defence-in-depth) ──────────────────────────
+    if (!DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS.has(sortBy)) {
+      throw new Error(
+        `Invalid sortBy column: "${sortBy}". ` +
+        `Allowed: ${[...DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS].join(', ')}`,
+      );
+    }
+
+    // sortOrder is already constrained to 'asc' | 'desc' by the TypeScript
+    // type, but we assert at runtime in case callers bypass types.
+    const safeOrder = sortOrder === 'asc' ? 'ASC' : 'DESC';
+
+    // ── Build parameterised WHERE clauses ──────────────────────────────────
+    const conditions: string[] = ['investor_id = $1'];
+    const values: unknown[] = [investorId];
+
+    function addParam(value: unknown): string {
+      values.push(value);
+      return `$${values.length}`;
+    }
+
+    if (status !== undefined) {
+      conditions.push(`status = ${addParam(status)}`);
+    }
+    if (minAmount !== undefined) {
+      conditions.push(`amount::NUMERIC >= ${addParam(minAmount)}`);
+    }
+    if (maxAmount !== undefined) {
+      conditions.push(`amount::NUMERIC <= ${addParam(maxAmount)}`);
+    }
+    if (from !== undefined) {
+      conditions.push(`created_at >= ${addParam(from)}`);
+    }
+    if (to !== undefined) {
+      conditions.push(`created_at <= ${addParam(to)}`);
+    }
+
+    // ── ORDER BY column is whitelisted — safe to interpolate ──────────────
+    // For 'amount' we cast to NUMERIC so "10.5" sorts after "9.99".
+    const orderExpr = sortBy === 'amount'
+      ? `amount::NUMERIC ${safeOrder}`
+      : `${sortBy} ${safeOrder}`;
+
+    const limitParam  = addParam(limit);
+    const offsetParam = addParam(offset);
+
+    const query = `
+      SELECT
+        *,
+        COUNT(*) OVER() AS _total_count
+      FROM distribution_payouts
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY ${orderExpr}, id ASC
+      LIMIT ${limitParam} OFFSET ${offsetParam}
+    `;
+
+    const result = await this.db.query<Payout & { _total_count: string }>(query, values);
+
+    const total = result.rows.length > 0 ? parseInt(result.rows[0]._total_count, 10) : 0;
+    const payouts = result.rows.map((row) => this.mapPayout(row));
+
+    return { payouts, total };
   }
 
   /**
