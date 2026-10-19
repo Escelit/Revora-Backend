@@ -8,6 +8,8 @@ import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
+import { globalLogger } from '../lib/logger';
+import { globalMetrics } from '../lib/metrics';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -136,25 +138,37 @@ export class InvestmentService {
 
     // 7. Run AML transaction monitoring if service is available
     if (this.amlService) {
-      try {
-        const context: TransactionContext = {
+      // Resolve the investor's display name so name-based rules (sanctions_screening,
+      // geo_mismatch) receive a real name rather than a UUID.
+      const investorName = await this.resolveInvestorName(investment.investor_id);
+
+      const context: TransactionContext = {
+        investment_id: investment.id,
+        investor_id: investment.investor_id,
+        offering_id: investment.offering_id,
+        amount: investment.amount,
+        asset: investment.asset,
+        timestamp: investment.created_at,
+        investor_name: investorName,
+      };
+
+      // Fire-and-forget: AML evaluation is non-blocking so that a rules-engine
+      // hiccup never fails the investor's submission. All failures are surfaced
+      // via structured logging and the aml_evaluation_failures_total counter so
+      // they are visible in dashboards and alerts without silently swallowing them.
+      this.amlService.evaluateTransaction(context).catch((error: unknown) => {
+        globalLogger.error('AML evaluation failed', {
           investment_id: investment.id,
           investor_id: investment.investor_id,
-          offering_id: investment.offering_id,
-          amount: investment.amount,
-          asset: investment.asset,
-          timestamp: investment.created_at,
-        };
-
-        // Run AML evaluation asynchronously (non-blocking)
-        this.amlService.evaluateTransaction(context).catch(error => {
-          // Log error but don't fail the investment creation
-          console.error('AML evaluation failed:', error);
+          error: error instanceof Error ? error.message : String(error),
         });
-      } catch (error) {
-        // Log error but don't fail the investment creation
-        console.error('AML evaluation setup failed:', error);
-      }
+        globalMetrics.incrementCounter(
+          'aml_evaluation_failures_total',
+          { reason: 'evaluation_error' },
+          1,
+          'Total number of AML evaluation failures on investment creation',
+        );
+      });
     }
 
     return investment;
